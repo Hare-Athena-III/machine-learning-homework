@@ -1,0 +1,299 @@
+\documentclass[a4paper]{article}
+\usepackage[margin=1in]{geometry}
+\usepackage{ctex}
+\usepackage{graphicx}
+\usepackage{amsmath}
+\usepackage{amssymb}
+\usepackage{booktabs}
+\usepackage{hyperref}
+\usepackage{caption}
+\usepackage{subcaption}
+\usepackage{xcolor}
+
+\title{\heiti\zihao{2} 基于度量学习和Vision Transformer的\\细粒度图像聚类方法}
+\author{\songti 张铭\quad 2023192004}
+\date{2026年7月}
+\begin{document}
+\maketitle
+
+\begin{abstract}
+\noindent
+细粒度图像聚类是计算机视觉领域的重要课题，旨在将同一物种或类别的子类图像进行无监督聚合。本文基于PyTorch框架，采用Vision Transformer架构的MegaDescriptor-B-224作为骨干网络，结合度量学习中的CircleLoss损失函数和余弦相似度度量，设计并训练了一个面向细粒度图像聚类任务的深度学习模型。在模型结构上，本文提出了一种带有残差连接的投影头结构，在保留骨干网络预训练特征的同时对特征进行微调。在训练策略上，采用冻结骨干网络、分组学习率、余弦退火调度和混合精度训练等技术，并使用MPerClassSampler进行类别均衡采样。在猫只个体识别数据集上的实验结果表明，本文方法取得了良好的聚类效果，最优NMI达到0.8761，Recall@1达到0.6903，验证了所提方法的有效性。
+\end{abstract}
+
+\tableofcontents
+\newpage
+
+\section{引言}
+\label{sec:intro}
+
+细粒度图像分析是计算机视觉中的一个重要分支，其目标是对某一类物体的子类进行精细区分，例如不同品种的狗、不同型号的飞机、不同个体的动物等。与传统的图像分类任务不同，细粒度分类任务中不同类别之间的视觉差异极其微小，往往仅体现在局部区域的细微纹理、颜色或形状差异上，这对特征提取能力提出了极高的要求。
+
+近年来，深度学习技术在细粒度图像识别领域取得了显著进展。卷积神经网络（CNN）和Vision Transformer（ViT）等深度模型能够自动学习层次化的视觉特征表示，为实现高质量的细粒度图像分析提供了坚实基础。与此同时，度量学习（Metric Learning）作为一种有效的特征学习范式，通过将同一类别的样本在嵌入空间中拉近、不同类别的样本推远，为聚类和检索任务提供了强有力的工具。
+
+在动物个体识别（Animal ReID）这一典型细粒度任务中，要求模型能够仅凭外观特征识别出不同的个体动物。例如，对于猫只个体识别，不同猫之间可能存在相似的花纹和体型，而同一只猫在不同光照、角度下的照片又可能存在较大差异，这使得该任务极具挑战性。
+
+本文基于PyTorch深度学习框架，设计并训练了一个用于细粒度图像聚类的模型。本文的主要贡献如下：
+
+\begin{enumerate}
+    \item 采用HuggingFace上的MegaDescriptor-B-224（基于ViT架构的预训练模型）作为骨干特征提取网络，充分利用其在动物识别任务上的预训练知识。
+    \item 设计了一种带有残差连接的轻量级投影头结构，在保持骨干网络原始特征质量的同时，通过微调适配特定任务。
+    \item 引入CircleLoss作为度量学习损失函数，结合余弦相似度度量，有效提升了嵌入空间的判别性。
+    \item 采用丰富的训练策略，包括冻结微调、分组学习率、余弦退火、混合精度训练、类别均衡采样和数据增强等，实现了稳定高效的训练过程。
+    \item 使用HDBSCAN密度聚类算法对提取的特征进行聚类，并采用调整兰德指数（ARI）、归一化互信息（NMI）和Recall@K等指标进行全面评估。
+\end{enumerate}
+
+实验在猫只个体识别数据集上进行，结果验证了所提方法的有效性，在多个评估指标上均取得了良好的表现。
+
+\section{相关方法}
+\label{sec:method}
+
+\subsection{整体框架}
+
+本文设计的细粒度图像聚类系统主要由四个阶段组成：数据预处理与增强、特征提取与嵌入学习、度量学习优化、聚类与评估。整体流程如图\ref{fig:pipeline}所示。
+
+\begin{figure}[htbp]
+\centering
+\fbox{\parbox{0.8\textwidth}{\centering
+\textbf{训练流程：}\\
+原始图像 $\rightarrow$ 数据增强 $\rightarrow$ MegaDescriptor骨干网络 $\rightarrow$ 投影头 $\rightarrow$ L2归一化嵌入 \\
+$\downarrow$ \\
+CircleLoss $\leftarrow$ MPerClassSampler均衡采样 \\
+$\downarrow$ \\
+反向传播 $\rightarrow$ 更新参数
+\vspace{0.3cm}
+
+\textbf{评估流程：}\\
+测试图像 $\rightarrow$ 预处理 $\rightarrow$ 训练好的模型 $\rightarrow$ 256维嵌入 \\
+$\downarrow$ \\
+HDBSCAN聚类 $\rightarrow$ ARI / NMI / Recall@K}}
+\caption{系统整体流程示意图}
+\label{fig:pipeline}
+\end{figure}
+
+\subsection{骨干网络：MegaDescriptor-B-224}
+
+本文采用MegaDescriptor-B-224作为骨干特征提取网络。MegaDescriptor是基于Vision Transformer（ViT）架构构建的大规模动物识别预训练模型，由BVRA团队在HuggingFace上开源发布。该模型在包含数万种动物类别的大规模数据集上进行了预训练，具备强大的动物视觉特征提取能力。
+
+MegaDescriptor-B-224的特点如下：
+\begin{itemize}
+    \item 采用ViT-Base架构，将图像切分为$16\times16$的Patch，通过Transformer编码器进行全局自注意力建模。
+    \item 在动物识别领域的大规模数据集上进行了充分预训练，能够提取具有高度判别性的动物外观特征。
+    \item 输出维度为768维的特征向量，为后续的投影头提供了丰富的语义信息。
+\end{itemize}
+
+使用预训练模型可以显著减少对标注数据的需求，加速训练收敛，提高最终性能。
+
+\subsection{投影头与残差连接}
+
+为了将骨干网络提取的768维特征映射到更适合度量学习的256维嵌入空间，本文设计了一个带有残差连接的投影头模块。投影头的结构如式\ref{eq:proj}所示。
+
+\begin{equation}
+\label{eq:proj}
+\mathbf{e} = \text{L2Norm}\left(\mathbf{W}_{\text{res}}\mathbf{f} + 0.05 \cdot \text{MLP}(\mathbf{f})\right)
+\end{equation}
+
+其中$\mathbf{f}\in\mathbb{R}^{768}$为骨干网络提取的特征，$\mathbf{W}_{\text{res}}\in\mathbb{R}^{768\times256}$为残差线性映射，MLP为三层全连接网络（$768\rightarrow512\rightarrow256$，含BatchNorm、ReLU和Dropout）。最终输出进行L2归一化，得到单位超球面上的嵌入向量。
+
+残差连接的设计思想是：保留骨干网络原始特征的100\%信息（通过线性映射），同时仅用投影头做5\%的微调修正。这种设计既能充分利用预训练特征的质量，又能为特定任务提供灵活的自适应能力。实验表明，这种设计比单独使用投影头或单独使用残差映射取得了更好的效果。
+
+\subsection{度量学习：CircleLoss}
+
+度量学习的核心目标是学习一个嵌入空间，使得同类样本距离近、异类样本距离远。本文采用CircleLoss作为损失函数，其定义如式\ref{eq:circle}所示。
+
+\begin{equation}
+\label{eq:circle}
+\mathcal{L}_{\text{circle}} = \log\left[1 + \sum_{j\in\Omega_n} e^{\gamma(s^j_n - \Delta_n)} \sum_{i\in\Omega_p} e^{\gamma(-s^i_p + \Delta_p)}\right]
+\end{equation}
+
+其中$s_p$和$s_n$分别为正样本对和负样本对的余弦相似度，$\Omega_p$和$\Omega_n$分别表示正负样本对集合，$\gamma$为缩放因子（本文设为256），$\Delta_p=1-m$和$\Delta_n=m$为边界参数（$m=0.25$）。
+
+与传统TripletLoss相比，CircleLoss具有以下优势：
+\begin{itemize}
+    \item 对正负样本对的优化权重进行自适应调整，使得对已经分离很好的样本对给予较小的梯度，而对边界附近的样本对给予较大的梯度。
+    \item 优化目标更加灵活，不要求严格的边界条件，收敛更加平滑。
+    \item 在细粒度分类任务中表现出更优的嵌入质量。
+\end{itemize}
+
+本文使用余弦相似度（CosineSimilarity）作为距离度量，相比欧氏距离，余弦相似度对特征向量的尺度不敏感，更适合处理归一化的嵌入向量。
+
+\subsection{类别均衡采样}
+
+在细粒度聚类任务中，不同类别的样本数量往往不均衡。为了解决这一问题，本文采用MPerClassSampler采样策略，即每个Batch中保证每个类别选取m个样本（本文m=6）。这种策略确保：
+
+\begin{itemize}
+    \item 每个Batch中各类别样本数量均衡，避免模型偏向多数类。
+    \item 保证每个Batch内都有足够的正样本对和负样本对，有利于度量学习损失函数的优化。
+    \item 提高了训练效率，减少了无效的样本对。
+\end{itemize}
+
+\subsection{聚类与评估方法}
+
+\subsubsection{HDBSCAN密度聚类}
+
+在提取图像嵌入后，本文采用HDBSCAN（Hierarchical Density-Based Spatial Clustering of Applications with Noise）算法进行聚类。HDBSCAN是一种基于密度的层次聚类算法，相比传统的K-Means算法，其优势在于：
+
+\begin{itemize}
+    \item 不需要预先指定聚类数量，能够自动发现数据中的聚类结构。
+    \item 能够识别和剔除噪声点，将不属于任何聚类的样本标记为-1。
+    \item 对非球形分布的数据簇具有良好的适应性。
+\end{itemize}
+
+本文设置最小簇大小（min\_cluster\_size）为3，聚类选择容忍度（cluster\_selection\_epsilon）为0.0。
+
+\subsubsection{评估指标}
+
+本文采用多种指标对聚类和检索性能进行全面评估：
+
+\begin{itemize}
+    \item \textbf{ARI（Adjusted Rand Index）}：衡量聚类结果与真实标签的相似度，取值范围$[-1,1]$，越接近1表示聚类效果越好，且对随机聚类的期望值为0。
+    \item \textbf{NMI（Normalized Mutual Information）}：衡量聚类结果与真实标签之间的互信息，取值范围$[0,1]$，越接近1表示聚类效果越好。
+    \item \textbf{Recall@K}：在检索任务中，从嵌入空间中找出与查询样本最相似的K个样本，计算其中属于同类的比例。本文采用R@1和R@5两个指标。
+    \item \textbf{噪声比例（Noise Ratio）}：HDBSCAN标记为噪声（-1）的样本占比，反映了聚类算法对数据的覆盖程度。
+\end{itemize}
+
+\section{实验}
+\label{sec:exp}
+
+\subsection{实验设置}
+
+\subsubsection{数据集}
+
+实验采用猫只个体识别数据集，训练集和验证集分别包含不同数量的猫只个体图像。每张图像均为RGB彩色图像，尺寸不一。数据集通过mapping.csv文件提供图像文件名与个体ID的对应关系。
+
+\subsubsection{数据增强}
+
+为了提升模型的泛化能力和鲁棒性，本文采用了丰富的数据增强策略：
+
+\begin{itemize}
+    \item 随机Resize裁剪（RandomResizedCrop）：将图像缩放到$256\times256$后随机裁剪到$224\times224$，裁剪比例范围为$0.7\sim1.0$。
+    \item 随机水平翻转（RandomHorizontalFlip）：概率为0.5。
+    \item 颜色抖动（ColorJitter）：调整亮度（0.2）、对比度（0.15）、饱和度（0.15）和色调（0.05）。
+    \item 随机旋转（RandomRotation）：旋转角度范围为$\pm10^\circ$。
+    \item 标准化（Normalize）：使用ImageNet均值和标准差进行归一化。
+    \item 随机擦除（RandomErasing）：概率为0.5，擦除区域比例为$0.02\sim0.2$。
+\end{itemize}
+
+验证集仅使用Resize到256后中心裁剪到224，以及标准化处理。
+
+\subsubsection{训练参数}
+
+主要训练参数如表\ref{tab:params}所示。
+
+\begin{table}[htbp]
+\centering
+\caption{主要训练参数配置}
+\label{tab:params}
+\begin{tabular}{lc}
+\toprule
+参数名称 & 配置值 \\
+\midrule
+嵌入维度 & 256 \\
+Batch大小 & 32 \\
+训练轮数 & 60 \\
+初始学习率 & $1\times10^{-4}$ \\
+骨干学习率比例 & 0.05 \\
+\hline
+损失函数 & CircleLoss（$m=0.25, \gamma=256$） \\
+距离度量 & 余弦相似度 \\
+优化器 & AdamW \\
+学习率调度 & CosineAnnealing \\
+采样策略 & MPerClassSampler（$m=6$） \\
+\hline
+混合精度 & AMP（自动混合精度） \\
+梯度裁剪 & max\_norm=1.0 \\
+验证间隔 & 2轮 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection{训练策略}
+
+本文采用分阶段训练策略：
+
+\begin{enumerate}
+    \item \textbf{冻结阶段}：首先冻结骨干网络的所有参数，仅训练投影头（包括MLP和残差映射）。这一阶段让投影头学习如何将预训练特征映射到度量学习空间。
+    \item \textbf{分组学习率}：为骨干网络和投影头设置不同的学习率。骨干网络学习率为基础学习率的0.05倍（$5\times10^{-6}$），投影头学习率为基础学习率的0.5倍（$5\times10^{-5}$）。这种设置允许投影头较快适应，同时防止骨干网络参数发生剧烈变化。
+    \item \textbf{余弦退火调度}：学习率按照余弦函数从初始值逐渐衰减到0，使得训练前期学习率较大以便快速收敛，后期学习率较小以便精细微调。
+    \item \textbf{混合精度训练}：使用PyTorch的自动混合精度（AMP）技术，在保持模型精度的同时减少显存占用并加速训练。
+    \item \textbf{梯度裁剪}：设置梯度最大范数为1.0，防止梯度爆炸。
+\end{enumerate}
+
+\subsection{实验结果与分析}
+
+\subsubsection{训练过程分析}
+
+图\ref{fig:curve}展示了训练过程中损失函数和各项评估指标的变化趋势。
+
+\begin{figure}[htbp]
+\centering
+\includegraphics[width=\textwidth]{torch_models/training_curve_20260710_231904.png}
+\caption{训练曲线（20260710训练结果）}
+\label{fig:curve}
+\end{figure}
+
+从训练曲线上可以观察到：
+
+\begin{enumerate}
+    \item \textbf{损失函数}：训练损失在整个训练过程中持续下降，从初始的较高值逐渐降低并趋于平稳，说明模型在学习过程中不断优化嵌入空间的质量。
+    \item \textbf{聚类指标}：ARI和NMI在训练初期增长迅速，随后进入平稳期并略有波动。这表明模型能够快速学习到有区分性的特征表示。
+    \item \textbf{检索指标}：Recall@1和Recall@5同样呈现先快速增长后趋于平稳的趋势。R@5始终显著高于R@1，说明虽然最相似样本不一定属于同类，但前5个最相似样本中包含正确类别的概率较高。
+    \item \textbf{学习率与噪声比例}：学习率按照余弦曲线平滑衰减，噪声比例随训练进程逐步降低，表明嵌入空间的聚类结构变得越来越清晰。
+\end{enumerate}
+
+\subsubsection{最终结果}
+
+表\ref{tab:results}列出了最佳模型在验证集上的最终评估结果（本实验中最佳ARI与最佳NMI对应同一模型）。
+
+\begin{table}[htbp]
+\centering
+\caption{验证集最终评估结果}
+\label{tab:results}
+\begin{tabular}{lccccc}
+\toprule
+模型 & ARI & NMI & R@1 & R@5 & 噪声比例 \\
+\midrule
+最佳模型 & 0.7501 & 0.8761 & 0.6903 & 0.8545 & 80.99\% \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+从结果可以看出：
+
+\begin{itemize}
+    \item NMI指标达到了0.8761的高水平，说明模型提取的嵌入具有良好的聚类结构，与真实标签的互信息较高。
+    \item R@5达到了0.8545，说明在前5个检索结果中，有较大概率包含同类样本，验证了模型在实际检索任务中的有效性。
+    \item ARI指标达到了0.7501，表明聚类结果与真实标签具有高度一致性。
+    \item 噪声比例约为80.99\%，表明HDBSCAN将约81\%的样本识别为噪声点，仅约19\%的样本被分配到具体簇中。这主要是因为HDBSCAN的保守策略倾向于将不确定样本标记为噪声，结合后续的解冻微调可能进一步降低噪声比例。
+\end{itemize}
+
+\subsubsection{结果分析}
+
+本文方法取得较好效果的原因可归纳为以下几点：
+
+\begin{enumerate}
+    \item \textbf{强大的预训练骨干}：MegaDescriptor-B-224在动物识别领域的大规模数据上预训练，提供了高质量的初始特征表示。
+    \item \textbf{有效的度量学习}：CircleLoss结合余弦相似度，在嵌入空间中形成了类内紧凑、类间分离的分布结构。
+    \item \textbf{合理的训练策略}：冻结微调、分组学习率和余弦退火等策略确保了训练的稳定性和最终性能。
+    \item \textbf{丰富的增强手段}：数据增强增加了训练数据的多样性，提升了模型的泛化能力。
+\end{enumerate}
+
+同时，也存在一些可以进一步改进的方向：
+
+\begin{enumerate}
+    \item \textbf{解冻骨干网络}：在训练后期适度解冻骨干网络的最后几个层，可以进一步提升特征表示能力。
+    \item \textbf{更优的聚类算法}：探索使用更先进的聚类方法或对HDBSCAN参数进行调优，以降低噪声比例。
+    \item \textbf{集成学习}：融合多个训练周期的模型特征，可能获得更稳定和更优的聚类结果。
+    \item \textbf{数据扩展}：增加更多高质量的标注数据，尤其是在困难样本上，有助于提升模型性能。
+\end{enumerate}
+
+\section{总结}
+\label{sec:conclusion}
+
+本文针对细粒度图像聚类任务，基于PyTorch框架设计并实现了一套完整的解决方案。在模型层面，采用MegaDescriptor-B-224作为骨干网络，结合带有残差连接的投影头和CircleLoss度量学习损失函数，构建了一个有效的特征嵌入学习模型。在训练层面，采用冻结微调、分组学习率、余弦退火、混合精度训练、MPerClassSampler均衡采样和丰富的数据增强等技术手段，确保了训练的高效性和稳定性。在评估层面，使用HDBSCAN密度聚类算法结合ARI、NMI、Recall@K和噪声比例等多维度指标，对模型性能进行了全面评估。
+
+实验结果表明，本文方法能够在猫只个体识别数据集上取得良好的聚类和检索效果，最佳模型上ARI达到0.7501，NMI达到0.8761，R@1达到0.6903，R@5达到0.8545。这些结果验证了将Vision Transformer预训练模型与度量学习相结合解决细粒度图像聚类任务的有效性。
+
+尽管取得了一定的成果，本文方法仍存在改进空间。未来的工作可以考虑解冻骨干网络进行端到端微调、探索更优的聚类算法、引入注意力机制增强局部特征提取能力，以及在更大规模的数据集上进行验证。
+
+\end{document}

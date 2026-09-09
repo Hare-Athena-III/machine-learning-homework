@@ -1,0 +1,25 @@
+# 数据集与大数据文件
+data/
+*.npy
+
+# Python
+__pycache__/
+*.pyc
+
+# 模型输出与中间结果
+torch_models/__pycache__/
+test_predictions*.csv
+val_predictions*.csv
+*_predictions*.csv
+
+# LaTeX 编译产物
+*.aux
+*.bbl
+*.blg
+*.log
+*.out
+*.synctex.gz
+*.toc
+
+# 编辑器
+.vscode/
