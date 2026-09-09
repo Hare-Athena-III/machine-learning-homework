@@ -2,6 +2,10 @@
 data/
 *.npy
 
+# 文档报告与本地数据
+*.docx
+iris.data
+
 # Python
 __pycache__/
 *.pyc
